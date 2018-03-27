@@ -1,55 +1,70 @@
 #!/bin/bash
 set -e
-export DEBIAN_FRONTEND=noninteractive
 
-userConfPath="/etc/sftp-users.conf"
-userConfFinalPath="/var/run/sftp-users.conf"
+# Paths
+userConfPath="/etc/sftp/users.conf"
+userConfPathLegacy="/etc/sftp-users.conf"
+userConfFinalPath="/var/run/sftp/users.conf"
 
-function printHelp() {
-    echo "Add users as command arguments, STDIN or mounted in $userConfPath"
-    echo "Syntax: user:pass[:e][:uid[:gid[:dir1[,dir2]...]]] ..."
-    echo "Use --readme for more information and examples."
+# Extended regular expression (ERE) for arguments
+reUser='[A-Za-z0-9._][A-Za-z0-9._-]{0,31}' # POSIX.1-2008
+rePass='[^:]{0,255}'
+reUid='[[:digit:]]*'
+reGid='[[:digit:]]*'
+reDir='[^:]*'
+reArgs="^($reUser)(:$rePass)(:e)?(:$reUid)?(:$reGid)?(:$reDir)?$"
+reArgsMaybe="^[^:[:space:]]+:.*$" # Smallest indication of attempt to use argument
+reArgSkip='^([[:blank:]]*#.*|[[:blank:]]*)$' # comment or empty line
+
+function log() {
+    echo "[entrypoint] $@"
 }
 
-function printReadme() {
-    cat /README.md
-    echo "TIP: Read this in HTML format here: https://github.com/atmoz/sftp"
+function validateArg() {
+    name="$1"
+    val="$2"
+    re="$3"
+
+    if [[ "$val" =~ ^$re$ ]]; then
+        return 0
+    else
+        log "ERROR: Invalid $name \"$val\", do not match required regex pattern: $re"
+        return 1
+    fi
 }
 
 function createUser() {
-    IFS=':' read -a param <<< $@
-    user="${param[0]}"
-    pass="${param[1]}"
+    log "Parsing user data: \"$@\""
 
-    if [ "${param[2]}" == "e" ]; then
+    IFS=':' read -a args <<< $@
+
+    skipIndex=0
+    chpasswdOptions=""
+    useraddOptions="--no-user-group"
+
+    user="${args[0]}"; validateArg "username" "$user" "$reUser" || return 1
+    pass="${args[1]}"; validateArg "password" "$pass" "$rePass" || return 1
+
+    if [ "${args[2]}" == "e" ]; then
         chpasswdOptions="-e"
-        uid="${param[3]}"
-        gid="${param[4]}"
-        dir="${param[5]}"
-    else
-        uid="${param[2]}"
-        gid="${param[3]}"
-        dir="${param[4]}"
+        skipIndex=1
     fi
 
-    if [ -z "$user" ]; then
-        echo "FATAL: You must at least provide a username."
-        exit 1
-    fi
+    uid="${args[$[$skipIndex+2]]}"; validateArg "UID" "$uid" "$reUid" || return 1
+    gid="${args[$[$skipIndex+3]]}"; validateArg "GID" "$gid" "$reGid" || return 1
+    dir="${args[$[$skipIndex+4]]}"; validateArg "dirs" "$dir" "$reDir" || return 1
 
-    if $(cat /etc/passwd | cut -d: -f1 | grep -q "^$user:"); then
-        echo "WARNING: User \"$user\" already exists. Skipping."
+    if getent passwd $user > /dev/null; then
+        log "WARNING: User \"$user\" already exists. Skipping."
         return 0
     fi
-
-    useraddOptions="--no-user-group"
 
     if [ -n "$uid" ]; then
         useraddOptions="$useraddOptions --non-unique --uid $uid"
     fi
 
     if [ -n "$gid" ]; then
-        if ! $(cat /etc/group | cut -d: -f3 | grep -q "$gid"); then
+        if ! getent group $gid > /dev/null; then
             groupadd --gid $gid "group_$gid"
         fi
 
@@ -61,6 +76,10 @@ function createUser() {
     chown root:root /home/$user
     chmod 755 /home/$user
 
+    # Retrieving user id to use it in chown commands instead of the user name
+    # to avoid problems on alpine when the user name contains a '.'
+    uid="$(id -u $user)"
+
     if [ -n "$pass" ]; then
         echo "$user:$pass" | chpasswd $chpasswdOptions
     else
@@ -69,64 +88,76 @@ function createUser() {
 
     # Add SSH keys to authorized_keys with valid permissions
     if [ -d /home/$user/.ssh/keys ]; then
-        cat /home/$user/.ssh/keys/* >> /home/$user/.ssh/authorized_keys
-        chown $user /home/$user/.ssh/authorized_keys
+        for publickey in /home/$user/.ssh/keys/*; do
+            cat $publickey >> /home/$user/.ssh/authorized_keys
+        done
+        chown $uid /home/$user/.ssh/authorized_keys
         chmod 600 /home/$user/.ssh/authorized_keys
     fi
 
-    # Make sure dirs exists and has correct permissions
+    # Make sure dirs exists
     if [ -n "$dir" ]; then
-        IFS=',' read -a dirParam <<< $dir
-        for dirPath in ${dirParam[@]}; do
-            dirPath=/home/$user/$dirPath
-            echo "Creating and/or setting permissions on $dirPath"
-            mkdir -p $dirPath
-            chown -R $user:users $dirPath
+        IFS=',' read -a dirArgs <<< $dir
+        for dirPath in ${dirArgs[@]}; do
+            dirPath="/home/$user/$dirPath"
+            if [ ! -d "$dirPath" ]; then
+                log "Creating directory: $dirPath"
+                mkdir -p $dirPath
+                chown -R $uid:users $dirPath
+            else
+                log "Directory already exists: $dirPath"
+            fi
         done
     fi
 }
 
-if [[ $1 =~ ^--help$|^-h$ ]]; then
-    printHelp
-    exit 0
+# Allow running other programs, e.g. bash
+if [[ -z "$1" || "$1" =~ $reArgsMaybe ]]; then
+    startSshd=true
+else
+    startSshd=false
 fi
 
-if [ "$1" == "--readme" ]; then
-    printReadme
-    exit 0
+# Backward compatibility with legacy config path
+if [ ! -f "$userConfPath" -a -f "$userConfPathLegacy" ]; then
+    mkdir -p "$(dirname $userConfPath)"
+    ln -s "$userConfPathLegacy" "$userConfPath"
 fi
 
 # Create users only on first run
 if [ ! -f "$userConfFinalPath" ]; then
+    mkdir -p "$(dirname $userConfFinalPath)"
 
     # Append mounted config to final config
     if [ -f "$userConfPath" ]; then
-        cat "$userConfPath" | grep -v -e '^$' > "$userConfFinalPath"
+        cat "$userConfPath" | grep -v -E "$reArgSkip" > "$userConfFinalPath"
     fi
 
-    # Append users from arguments to final config
-    for user in "$@"; do
-        echo "$user" >> "$userConfFinalPath"
-    done
+    if $startSshd; then
+        # Append users from arguments to final config
+        for user in "$@"; do
+            echo "$user" >> "$userConfFinalPath"
+        done
+    fi
 
-    # Append users from STDIN to final config
-    if [ ! -t 0 ]; then
-        while IFS= read -r user || [[ -n "$user" ]]; do
+    if [ -n "$SFTP_USERS" ]; then
+        # Append users from environment variable to final config
+        usersFromEnv=($SFTP_USERS) # as array
+        for user in "${usersFromEnv[@]}"; do
             echo "$user" >> "$userConfFinalPath"
         done
     fi
 
     # Check that we have users in config
-    if [ "$(cat "$userConfFinalPath" | wc -l)" == 0 ]; then
-        echo "FATAL: No users provided!"
-        printHelp
+    if [[ -f "$userConfFinalPath" && "$(cat "$userConfFinalPath" | wc -l)" > 0 ]]; then
+        # Import users from final conf file
+        while IFS= read -r user || [[ -n "$user" ]]; do
+            createUser "$user"
+        done < "$userConfFinalPath"
+    elif $startSshd; then
+        log "FATAL: No users provided!"
         exit 3
     fi
-
-    # Import users from final conf file
-    while IFS= read -r user || [[ -n "$user" ]]; do
-        createUser "$user"
-    done < "$userConfFinalPath"
 
     # Generate unique ssh keys for this container, if needed
     if [ ! -f /etc/ssh/ssh_host_ed25519_key ]; then
@@ -141,8 +172,10 @@ fi
 if [ -d /etc/sftp.d ]; then
     for f in /etc/sftp.d/*; do
         if [ -x "$f" ]; then
-            echo "Running $f ..."
+            log "Running $f ..."
             $f
+        else
+            log "Could not run $f, because it's missing execute permission (+x)."
         fi
     done
     unset f
@@ -150,7 +183,7 @@ fi
 
 #s3fs_fuse filesystem - only supported in single-user + dir scenario
 
-eval /usr/bin/s3fs -o allow_other -o use_cache=/tmp -o endpoint=us-west-2 $S3_BUCKET_NAME $dirPath 
+eval /usr/bin/s3fs -o allow_other -o use_cache=/tmp -o endpoint=us-west-2 $S3_BUCKET_NAME $dirPath
 
 echo "DEBUG: finished running s3fs"
 
