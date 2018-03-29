@@ -25,7 +25,7 @@ COPY entrypoint /
 
 # - add s3fs_fuse filesystem:
 
-ENV VERSION 1.80
+ENV VERSION=1.83 REGION=ap-southeast-1 S3_BUCKET_NAME=stg-recon-sftp dirPath=/home
 
 RUN curl -L https://github.com/s3fs-fuse/s3fs-fuse/archive/v${VERSION}.tar.gz | tar zxv -C /usr/src
 RUN cd /usr/src/s3fs-fuse-${VERSION} && ./autogen.sh && ./configure --prefix=/usr && make && make install

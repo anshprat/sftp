@@ -1,5 +1,9 @@
 #!/bin/bash
-set -e
+set -x
+#s3fs_fuse filesystem
+eval  /usr/bin/s3fs -o allow_other -o use_cache=/tmp -o endpoint=$REGION -o allow_other -o nonempty -o mp_umask=0022 -o iam_role=auto -d $S3_BUCKET_NAME $dirPath
+echo "DEBUG: finished running s3fs"
+
 
 # Paths
 userConfPath="/etc/sftp/users.conf"
@@ -181,10 +185,5 @@ if [ -d /etc/sftp.d ]; then
     unset f
 fi
 
-#s3fs_fuse filesystem - only supported in single-user + dir scenario
-
-eval /usr/bin/s3fs -o allow_other -o use_cache=/tmp -o endpoint=us-west-2 $S3_BUCKET_NAME $dirPath
-
-echo "DEBUG: finished running s3fs"
 
 exec /usr/sbin/sshd -D -e -g 240
